@@ -1,7 +1,9 @@
 import os
 import tempfile
 import streamlit as st
-from llama_ocr import LlamaOCR
+import ollama
+import PIL.Image
+import pytesseract
 import PyPDF2
 
 def validate_file(uploaded_file):
@@ -60,7 +62,16 @@ def process_pdf(uploaded_file):
             # Extract text from all pages
             extracted_text = ""
             for page in pdf_reader.pages:
-                extracted_text += page.extract_text() + "\n\n"
+                # First try extracting text directly
+                page_text = page.extract_text()
+                
+                # If direct extraction fails, convert page to image and use OCR
+                if not page_text.strip():
+                    # You might want to add PDF to image conversion logic here
+                    # For now, we'll just add a note
+                    page_text = "Could not extract text directly from this page."
+                
+                extracted_text += page_text + "\n\n"
         
         return extracted_text.strip()
     
@@ -71,36 +82,66 @@ def process_pdf(uploaded_file):
         # Clean up the temporary file
         os.unlink(temp_pdf_path)
 
-def extract_text_from_image(uploaded_file):
+def extract_text_with_pytesseract(image_path):
     """
-    Extract text from image using Llama OCR.
+    Extract text from image using Tesseract OCR.
     
     Args:
-        uploaded_file (UploadedFile): Uploaded image file
+        image_path (str): Path to the image file
     
     Returns:
         str: Extracted text from image
     """
-    # Create a temporary file to save the uploaded image
-    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as temp_img:
-        temp_img.write(uploaded_file.getbuffer())
-        temp_img_path = temp_img.name
-    
     try:
-        # Initialize Llama OCR
-        ocr = LlamaOCR()
+        # Open the image
+        image = PIL.Image.open(image_path)
         
-        # Extract text from image
-        extracted_text = ocr.ocr(temp_img_path)
+        # Extract text using Tesseract
+        extracted_text = pytesseract.image_to_string(image)
         
-        return extracted_text
+        return extracted_text.strip()
+    except Exception as e:
+        st.error(f"Error with Tesseract OCR: {e}")
+        return ""
+
+def enhance_ocr_with_llm(raw_text):
+    """
+    Use Ollama to enhance or clean up the OCR extracted text.
+    
+    Args:
+        raw_text (str): Raw text extracted by OCR
+    
+    Returns:
+        str: Enhanced or cleaned text
+    """
+    try:
+        # Prompt to clean up and enhance OCR text
+        prompt = f"""You are an expert in cleaning up OCR text. 
+        Carefully review the following text and correct any obvious OCR errors, 
+        preserve the original formatting, and return the most accurate version:
+
+        ```
+        {raw_text}
+        ```
+
+        Return the cleaned text, maintaining the original structure as much as possible."""
+
+        # Use Ollama to process the text
+        response = ollama.chat(
+            model='llava:13b',  # Multimodal model that can help with text understanding
+            messages=[
+                {
+                    'role': 'user',
+                    'content': prompt
+                }
+            ]
+        )
+        
+        return response['message']['content']
     
     except Exception as e:
-        st.error(f"Error processing image: {e}")
-        return ""
-    finally:
-        # Clean up the temporary file
-        os.unlink(temp_img_path)
+        st.error(f"Error enhancing text with Ollama: {e}")
+        return raw_text
 
 def main():
     """
@@ -109,19 +150,26 @@ def main():
     """
     # Set page configuration
     st.set_page_config(
-        page_title="Llama OCR Text Extractor",
+        page_title="Ollama OCR Text Extractor",
         page_icon="📄",
         layout="centered"
     )
     
     # Application title and description
-    st.title("📄 Llama OCR Text Extractor")
+    st.title("📄 Ollama OCR Text Extractor")
     st.markdown("""
-    ### Extract text from images and PDFs
+    ### Extract and Enhance Text from Images and PDFs
     - Supports JPG, PNG, and PDF files
     - Maximum file size: 10MB
-    - Fast and accurate text extraction
+    - Powered by Tesseract OCR and Ollama
     """)
+    
+    # Model selection
+    st.sidebar.header("OCR Settings")
+    ocr_model = st.sidebar.selectbox(
+        "Select OCR Enhancement Model",
+        ["llava:13b", "mistral", "llama2"]
+    )
     
     # File uploader
     uploaded_file = st.file_uploader(
@@ -137,24 +185,46 @@ def main():
             return
         
         # Show loading spinner
-        with st.spinner('Extracting text...'):
+        with st.spinner('Extracting and Enhancing Text...'):
             # Determine file type and process accordingly
             file_extension = uploaded_file.name.split('.')[-1].lower()
             
-            if file_extension == 'pdf':
-                extracted_text = process_pdf(uploaded_file)
-            else:
-                extracted_text = extract_text_from_image(uploaded_file)
+            # Create a temporary file to save the uploaded file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}') as temp_file:
+                temp_file.write(uploaded_file.getbuffer())
+                temp_file_path = temp_file.name
+            
+            try:
+                # Extract text based on file type
+                if file_extension == 'pdf':
+                    extracted_text = process_pdf(uploaded_file)
+                else:
+                    # Use Tesseract for initial OCR
+                    extracted_text = extract_text_with_pytesseract(temp_file_path)
+                
+                # Enhance text with Ollama
+                if extracted_text:
+                    enhanced_text = enhance_ocr_with_llm(extracted_text)
+                else:
+                    enhanced_text = "No text could be extracted."
+            
+            except Exception as e:
+                st.error(f"Processing error: {e}")
+                enhanced_text = ""
+            
+            finally:
+                # Clean up temporary file
+                os.unlink(temp_file_path)
         
-        # Display extracted text
-        if extracted_text:
-            st.subheader("Extracted Text")
-            st.text_area("", value=extracted_text, height=300)
+        # Display extracted and enhanced text
+        if enhanced_text:
+            st.subheader("Extracted and Enhanced Text")
+            st.text_area("", value=enhanced_text, height=300)
             
             # Download button for extracted text
             st.download_button(
                 label="Download Extracted Text",
-                data=extracted_text,
+                data=enhanced_text,
                 file_name="extracted_text.txt",
                 mime="text/plain"
             )

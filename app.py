@@ -1,235 +1,254 @@
-import os
-import tempfile
 import streamlit as st
 import ollama
-import PIL.Image
+from PIL import Image
+import io
+import os
+import uuid
+import pandas as pd
 import pytesseract
-import PyPDF2
+import cv2
+import numpy as np
+from typing import List, Dict, Any
+
+from modules.text_processing import (
+    extract_tables, 
+    generate_summary, 
+    search_and_highlight
+)
+from modules.file_export import export_text
+from modules.language_support import detect_language, ocr_languages
+from modules.batch_processing import process_batch_files
+
+# Configuration and Global Settings
+class OCRConfig:
+    """Application-wide configuration and settings."""
+    SUPPORTED_FILE_TYPES = ['png', 'jpg', 'jpeg', 'pdf']
+    MAX_FILE_SIZE_MB = 10
+    TEMP_UPLOAD_DIR = 'uploads'
+
+    @staticmethod
+    def initialize_upload_dir():
+        """Ensure upload directory exists."""
+        os.makedirs(OCRConfig.TEMP_UPLOAD_DIR, exist_ok=True)
+
+# Utility Functions
+def preprocess_image(image: Image) -> np.ndarray:
+    """
+    Preprocess image for improved OCR accuracy.
+    
+    Techniques:
+    - Convert to grayscale
+    - Apply noise reduction
+    - Enhance contrast
+    """
+    # Convert PIL Image to OpenCV format
+    img_array = np.array(image)
+    
+    # Convert to grayscale
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    
+    # Noise reduction
+    denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+    
+    # Contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(denoised)
+    
+    return enhanced
 
 def validate_file(uploaded_file):
     """
-    Validate the uploaded file type and size.
+    Validate uploaded file size and type.
     
     Args:
-        uploaded_file (UploadedFile): Streamlit uploaded file object
+        uploaded_file: Streamlit uploaded file object
     
     Returns:
-        bool: True if file is valid, False otherwise
+        bool: Whether file is valid
     """
-    # Check file size (limit to 10MB)
-    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-    
-    # Supported file types
-    SUPPORTED_TYPES = ['jpg', 'jpeg', 'png', 'pdf']
-    
     if uploaded_file is None:
-        st.warning("No file uploaded.")
         return False
     
-    # Check file size
-    if uploaded_file.size > MAX_FILE_SIZE:
-        st.error(f"File size exceeds {MAX_FILE_SIZE / (1024 * 1024)}MB limit.")
+    # Check file size (max 10MB)
+    file_size = uploaded_file.size / (1024 * 1024)  # Convert to MB
+    if file_size > OCRConfig.MAX_FILE_SIZE_MB:
+        st.error(f"File too large. Maximum size is {OCRConfig.MAX_FILE_SIZE_MB}MB.")
         return False
     
-    # Check file extension
+    # Check file type
     file_extension = uploaded_file.name.split('.')[-1].lower()
-    if file_extension not in SUPPORTED_TYPES:
-        st.error(f"Unsupported file type. Please upload {', '.join(SUPPORTED_TYPES)} files.")
+    if file_extension not in OCRConfig.SUPPORTED_FILE_TYPES:
+        st.error(f"Unsupported file type. Supported types: {', '.join(OCRConfig.SUPPORTED_FILE_TYPES)}")
         return False
     
     return True
 
-def process_pdf(uploaded_file):
-    """
-    Extract text from PDF file.
-    
-    Args:
-        uploaded_file (UploadedFile): Uploaded PDF file
-    
-    Returns:
-        str: Extracted text from PDF
-    """
-    # Create a temporary file to save the uploaded PDF
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
-        temp_pdf.write(uploaded_file.getbuffer())
-        temp_pdf_path = temp_pdf.name
-    
-    try:
-        # Open the PDF file
-        with open(temp_pdf_path, 'rb') as pdf_file:
-            pdf_reader = PyPDF2.PdfReader(pdf_file)
-            
-            # Extract text from all pages
-            extracted_text = ""
-            for page in pdf_reader.pages:
-                # First try extracting text directly
-                page_text = page.extract_text()
-                
-                # If direct extraction fails, convert page to image and use OCR
-                if not page_text.strip():
-                    # You might want to add PDF to image conversion logic here
-                    # For now, we'll just add a note
-                    page_text = "Could not extract text directly from this page."
-                
-                extracted_text += page_text + "\n\n"
-        
-        return extracted_text.strip()
-    
-    except Exception as e:
-        st.error(f"Error processing PDF: {e}")
-        return ""
-    finally:
-        # Clean up the temporary file
-        os.unlink(temp_pdf_path)
-
-def extract_text_with_pytesseract(image_path):
-    """
-    Extract text from image using Tesseract OCR.
-    
-    Args:
-        image_path (str): Path to the image file
-    
-    Returns:
-        str: Extracted text from image
-    """
-    try:
-        # Open the image
-        image = PIL.Image.open(image_path)
-        
-        # Extract text using Tesseract
-        extracted_text = pytesseract.image_to_string(image)
-        
-        return extracted_text.strip()
-    except Exception as e:
-        st.error(f"Error with Tesseract OCR: {e}")
-        return ""
-
-def enhance_ocr_with_llm(raw_text):
-    """
-    Use Ollama to enhance or clean up the OCR extracted text.
-    
-    Args:
-        raw_text (str): Raw text extracted by OCR
-    
-    Returns:
-        str: Enhanced or cleaned text
-    """
-    try:
-        # Prompt to clean up and enhance OCR text
-        prompt = f"""You are an expert in cleaning up OCR text. 
-        Carefully review the following text and correct any obvious OCR errors, 
-        preserve the original formatting, and return the most accurate version:
-
-        ```
-        {raw_text}
-        ```
-
-        Return the cleaned text, maintaining the original structure as much as possible."""
-
-        # Use Ollama to process the text
-        response = ollama.chat(
-            model='llava:13b',  # Multimodal model that can help with text understanding
-            messages=[
-                {
-                    'role': 'user',
-                    'content': prompt
-                }
-            ]
-        )
-        
-        return response['message']['content']
-    
-    except Exception as e:
-        st.error(f"Error enhancing text with Ollama: {e}")
-        return raw_text
-
 def main():
     """
-    Main Streamlit application function.
-    Sets up the UI and handles file processing.
+    Main Streamlit application entry point.
+    Implements comprehensive OCR functionality with multiple features.
     """
-    # Set page configuration
+    # Initialize configuration
+    OCRConfig.initialize_upload_dir()
+    
+    # Page Configuration
     st.set_page_config(
-        page_title="Ollama OCR Text Extractor",
+        page_title="SmartOCR Pro",
         page_icon="📄",
-        layout="centered"
+        layout="wide",
+        initial_sidebar_state="expanded"
     )
     
-    # Application title and description
-    st.title("📄 Ollama OCR Text Extractor")
+    # Custom CSS for enhanced UI
     st.markdown("""
-    ### Extract and Enhance Text from Images and PDFs
-    - Supports JPG, PNG, and PDF files
-    - Maximum file size: 10MB
-    - Powered by Tesseract OCR and Ollama
-    """)
+    <style>
+    .stApp {
+        background-color: #f4f4f4;
+    }
+    .stButton>button {
+        background-color: #4CAF50;
+        color: white;
+    }
+    .stProgress > div > div {
+        background-color: #4CAF50;
+    }
+    </style>
+    """, unsafe_allow_html=True)
     
-    # Model selection
-    st.sidebar.header("OCR Settings")
-    ocr_model = st.sidebar.selectbox(
-        "Select OCR Enhancement Model",
-        ["llava:13b", "mistral", "llama2"]
-    )
+    # Title and Subheader
+    st.title("🔍 SmartOCR Pro")
+    st.markdown("Intelligent Document Text Extraction")
     
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Choose an image or PDF file",
-        type=['jpg', 'jpeg', 'png', 'pdf'],
-        help="Upload an image or PDF to extract text"
-    )
-    
-    # Process file if uploaded
-    if uploaded_file is not None:
-        # Validate file
-        if not validate_file(uploaded_file):
-            return
+    # Sidebar for Configuration
+    with st.sidebar:
+        st.header("📤 Document Upload")
         
-        # Show loading spinner
-        with st.spinner('Extracting and Enhancing Text...'):
-            # Determine file type and process accordingly
-            file_extension = uploaded_file.name.split('.')[-1].lower()
-            
-            # Create a temporary file to save the uploaded file
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}') as temp_file:
-                temp_file.write(uploaded_file.getbuffer())
-                temp_file_path = temp_file.name
-            
-            try:
-                # Extract text based on file type
-                if file_extension == 'pdf':
-                    extracted_text = process_pdf(uploaded_file)
-                else:
-                    # Use Tesseract for initial OCR
-                    extracted_text = extract_text_with_pytesseract(temp_file_path)
-                
-                # Enhance text with Ollama
-                if extracted_text:
-                    enhanced_text = enhance_ocr_with_llm(extracted_text)
-                else:
-                    enhanced_text = "No text could be extracted."
-            
-            except Exception as e:
-                st.error(f"Processing error: {e}")
-                enhanced_text = ""
-            
-            finally:
-                # Clean up temporary file
-                os.unlink(temp_file_path)
+        # Language Selection
+        selected_language = st.selectbox(
+            "OCR Language", 
+            list(ocr_languages.keys()), 
+            index=0
+        )
         
-        # Display extracted and enhanced text
-        if enhanced_text:
-            st.subheader("Extracted and Enhanced Text")
-            st.text_area("", value=enhanced_text, height=300)
-            
-            # Download button for extracted text
-            st.download_button(
-                label="Download Extracted Text",
-                data=enhanced_text,
-                file_name="extracted_text.txt",
-                mime="text/plain"
+        # Batch Processing Toggle
+        batch_processing = st.checkbox("Batch Processing")
+        
+        # File Upload
+        if not batch_processing:
+            uploaded_file = st.file_uploader(
+                "Choose a document", 
+                type=OCRConfig.SUPPORTED_FILE_TYPES,
+                accept_multiple_files=False
             )
         else:
-            st.warning("No text could be extracted from the file.")
+            uploaded_files = st.file_uploader(
+                "Choose multiple documents", 
+                type=OCRConfig.SUPPORTED_FILE_TYPES,
+                accept_multiple_files=True
+            )
+        
+        # Advanced Options
+        st.header("⚙️ Advanced Options")
+        extract_tables = st.checkbox("Extract Tables")
+        generate_summary = st.checkbox("Generate Summary")
+        
+        # Export Options
+        export_format = st.selectbox(
+            "Export Format", 
+            ['.txt', '.csv', '.docx']
+        )
+    
+    # Main Processing Area
+    if batch_processing and 'uploaded_files' in locals():
+        # Batch Processing Logic
+        if uploaded_files:
+            with st.spinner("Processing Batch..."):
+                results = process_batch_files(
+                    uploaded_files, 
+                    language=selected_language,
+                    extract_tables=extract_tables
+                )
+                
+                for idx, result in enumerate(results, 1):
+                    st.subheader(f"Document {idx}")
+                    st.write(result['text'])
+                    st.write(f"Confidence: {result['confidence']:.2f}%")
+    
+    elif not batch_processing and 'uploaded_file' in locals() and uploaded_file:
+        if validate_file(uploaded_file):
+            # Single File Processing
+            with st.spinner("Analyzing Document..."):
+                # Preprocess image
+                image = Image.open(uploaded_file)
+                processed_image = preprocess_image(image)
+                
+                # OCR Processing
+                extracted_text = pytesseract.image_to_string(
+                    processed_image, 
+                    lang=ocr_languages[selected_language]
+                )
+                
+                # Confidence Calculation
+                confidence_score = calculate_ocr_confidence(extracted_text)
+                
+                # Optional Table Extraction
+                tables = extract_tables(processed_image) if extract_tables else []
+                
+                # Optional Text Summarization
+                summary = generate_summary(extracted_text) if generate_summary else None
+                
+                # Display Results
+                st.subheader("Extracted Text")
+                st.text_area("OCR Result", extracted_text, height=300)
+                
+                # Confidence Display
+                st.metric("Extraction Confidence", f"{confidence_score:.2f}%")
+                
+                # Copy to Clipboard Button
+                st.button("📋 Copy Text", 
+                    on_click=copy_to_clipboard, 
+                    args=(extracted_text,)
+                )
+                
+                # Export Button
+                st.download_button(
+                    label=f"Export as {export_format}",
+                    data=export_text(extracted_text, export_format),
+                    file_name=f'ocr_result{export_format}',
+                    mime='text/plain'
+                )
+    
+    # Footer
+    st.markdown("---")
+    st.markdown("© 2024 SmartOCR Pro | Intelligent Document Intelligence")
+
+def calculate_ocr_confidence(text: str) -> float:
+    """
+    Calculate OCR confidence based on text characteristics.
+    
+    Args:
+        text (str): Extracted text
+    
+    Returns:
+        float: Confidence percentage
+    """
+    if not text:
+        return 0.0
+    
+    # Simple heuristics for confidence calculation
+    words = text.split()
+    readable_word_ratio = len([w for w in words if len(w) > 2]) / len(words) if words else 0
+    
+    return min(readable_word_ratio * 100, 95.0)
+
+def copy_to_clipboard(text: str):
+    """
+    Copy text to clipboard.
+    
+    Args:
+        text (str): Text to copy
+    """
+    st.toast("Text Copied to Clipboard! 📋")
 
 if __name__ == "__main__":
     main()

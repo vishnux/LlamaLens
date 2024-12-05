@@ -1,5 +1,2 @@
-streamlit>=1.29.0
-ollama>=0.1.0
-pytesseract>=0.3.10
-pillow>=9.5.0
-PyPDF2>=3.0.0
+llama-ocr
+streamlit
